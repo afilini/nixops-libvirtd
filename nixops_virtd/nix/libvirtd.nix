@@ -8,6 +8,9 @@ let
     name = "libvirtd-ssh-image";
     format = "qcow2";
     diskSize = config.deployment.libvirtd.baseImageSize * 1024;
+    partitionTableType = "efi";
+    touchEFIVars = true;
+    # installBootLoader = false;
     config = config;
     contents = [{
       source = (pkgs.writeText "authorized_keys.d-root" the_key);
@@ -133,10 +136,20 @@ in
     nixpkgs.system = mkOverride 900 "x86_64-linux";
 
     fileSystems."/".device = "/dev/disk/by-label/nixos";
+    fileSystems."/boot".device = "/dev/disk/by-label/ESP";
 
-    boot.loader.grub.version = 2;
-    boot.loader.grub.device = "/dev/sda";
-    boot.loader.timeout = 0;
+    boot.loader = {
+      timeout = 0;
+      efi = {
+        canTouchEfiVariables = true;
+        efiSysMountPoint = "/boot"; # ← use the same mount point here.
+      };
+      grub = {
+         efiSupport = true;
+         #efiInstallAsRemovable = true; # in case canTouchEfiVariables doesn't work for your system
+         device = "nodev";
+      };
+    };
 
     services.openssh.enable = true;
     services.openssh.startWhenNeeded = false;

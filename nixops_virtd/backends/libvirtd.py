@@ -13,6 +13,7 @@ import libvirt  # type: ignore
 import nixops.known_hosts
 import nixops.util
 from nixops.backends import MachineDefinition, MachineState
+from nixops.plugins.manager import PluginManager
 
 
 # to prevent libvirt errors from appearing on screen, see
@@ -82,6 +83,7 @@ class LibvirtdState(MachineState[LibvirtdDefinition]):
     domain_xml = nixops.util.attr_property("libvirtd.domainXML", None)
     disk_path = nixops.util.attr_property("libvirtd.diskPath", None)
     storage_volume_name = nixops.util.attr_property("libvirtd.storageVolume", None)
+    nvram_volume_name = nixops.util.attr_property("libvirtd.nvramVolume", None)
     storage_pool_name = nixops.util.attr_property("libvirtd.storagePool", None)
     vcpu = nixops.util.attr_property("libvirtd.vcpu", None)
 
@@ -99,6 +101,7 @@ class LibvirtdState(MachineState[LibvirtdDefinition]):
         self._dom = None
         self._pool = None
         self._vol = None
+        self._nvram = None
 
     @property
     def conn(self):
@@ -111,7 +114,7 @@ class LibvirtdState(MachineState[LibvirtdDefinition]):
                 if error.get_error_code() == libvirt.VIR_ERR_NO_CONNECT:
                     # this error code usually means "no connection driver available for qemu:///..."
                     self.logger.error(
-                        "make sure qemu-system-x86_64 is installed on the target host"
+                        "make sure qemu-system-aarch64 is installed on the target host"
                     )
                 raise Exception(
                     "Failed to connect to the hypervisor at {}".format(self.uri)
@@ -138,6 +141,12 @@ class LibvirtdState(MachineState[LibvirtdDefinition]):
         if self._vol is None:
             self._vol = self.pool.storageVolLookupByName(self.storage_volume_name)
         return self._vol
+
+    @property
+    def nvram(self):
+        if self._nvram is None:
+            self._nvram = self.pool.storageVolLookupByName(self.nvram_volume_name)
+        return self._nvram
 
     def get_console_output(self):
         import sys
@@ -210,8 +219,13 @@ class LibvirtdState(MachineState[LibvirtdDefinition]):
         if self.storage_volume_name is None:
             self._prepare_storage_volume()
             self.storage_volume_name = self.vol.name()
+        self.nvram_volume_name = 'nvram-' + self.storage_volume_name.replace('qcow2', 'raw')
+
+        print(self.storage_volume_name)
+        print(self.nvram_volume_name)
 
         self.domain_xml = self._make_domain_xml(defn)
+        print(self.domain_xml)
 
         if self.vm_id is None:
             # By using "define" we ensure that the domain is
@@ -231,33 +245,39 @@ class LibvirtdState(MachineState[LibvirtdDefinition]):
         newEnv = copy.deepcopy(os.environ)
         newEnv["NIXOPS_LIBVIRTD_PUBKEY"] = self.client_public_key
 
-        temp_image_path = os.path.join(
-            self.depl.tempdir, "libvirtd-image-{}".format(self.name)
+        temp_image_path = nixops.evaluation.eval(
+            networkExpr=self.depl.network_expr,
+            uuid=self.depl.uuid,
+            deploymentName=self.depl.name or "",
+            checkConfigurationOptions=False,
+            attr='nodes."{0}".config.deployment.libvirtd.baseImage'.format(self.name),
+            pluginNixExprs=PluginManager.nixexprs(),
+            build=True,
         )
-        self._logged_exec(
-            ["nix-build"]
-            + self.depl._eval_flags(self.depl.nix_exprs)
-            + [
-                "--arg",
-                "checkConfigurationOptions",
-                "false",
-                "-A",
-                "nodes.{0}.config.deployment.libvirtd.baseImage".format(self.name),
-                "-o",
-                temp_image_path,
-            ],
-            capture_stdout=True,
-            env=newEnv,
-        ).rstrip()
+        # self.depl.eval(
+        #     attr='nodes."{0}".config.deployment.libvirtd.baseImage'.format(self.name),
+        #     checkConfigurationOptions=False,
+        # )
 
         temp_disk_path = os.path.join(temp_image_path, "nixos.qcow2")
+        temp_nvram_path = os.path.join(temp_image_path, "efi-vars.fd")
 
         self.logger.log("uploading disk image...")
         image_info = self._get_image_info(temp_disk_path)
-        self._vol = self._create_volume(
-            image_info["virtual-size"], image_info["file-length"]
+
+        disk_xml = self._create_volume(
+            image_info["virtual-size"], image_info["file-length"], "qcow2",
         )
-        self._upload_volume(temp_disk_path, image_info["file-length"])
+        self._vol = self.pool.createXML(disk_xml)
+        self._upload_volume(self.vol, temp_disk_path, image_info["file-length"])
+
+        self.logger.log("uploading nvram vars...")
+        image_info = self._get_image_info(temp_nvram_path)
+        nvram_xml = self._create_volume(
+            image_info["virtual-size"], image_info["file-length"], "raw", "nvram-",
+        )
+        self._nvram = self.pool.createXML(nvram_xml)
+        self._upload_volume(self.nvram, temp_nvram_path, image_info["file-length"])
 
     def _get_image_info(self, filename):
         output = self._logged_exec(
@@ -269,28 +289,27 @@ class LibvirtdState(MachineState[LibvirtdDefinition]):
 
         return info
 
-    def _create_volume(self, virtual_size, file_length):
+    def _create_volume(self, virtual_size, file_length, disk_format, prefix=''):
         xml = """
         <volume>
           <name>{name}</name>
           <capacity>{virtual_size}</capacity>
           <allocation>{file_length}</allocation>
           <target>
-            <format type="qcow2"/>
+            <format type="{disk_format}"/>
           </target>
         </volume>
         """.format(
-            name="{}.qcow2".format(self._vm_id()),
+            name="{}{}.{}".format(prefix, self._vm_id(), disk_format),
             virtual_size=virtual_size,
             file_length=file_length,
+            disk_format=disk_format,
         )
-        vol = self.pool.createXML(xml)
-        self._vol = vol
-        return vol
+        return xml
 
-    def _upload_volume(self, filename, file_length):
+    def _upload_volume(self, which, filename, file_length):
         stream = self.conn.newStream()
-        self.vol.upload(stream, offset=0, length=file_length)
+        which.upload(stream, offset=0, length=file_length)
 
         def read_file(stream, nbytes, f):
             return f.read(nbytes)
@@ -302,8 +321,7 @@ class LibvirtdState(MachineState[LibvirtdDefinition]):
     def _get_qemu_executable(self):
         domaincaps_xml = self.conn.getDomainCapabilities(
             emulatorbin=None,
-            arch="x86_64",
-            machine=None,
+            arch="aarch64",
             virttype="kvm",
         )
         domaincaps = ElementTree.fromstring(domaincaps_xml)
@@ -324,6 +342,8 @@ class LibvirtdState(MachineState[LibvirtdDefinition]):
                     '    <interface type="network">',
                     maybe_mac(n),
                     '      <source network="{0}"/>',
+                    '      <model type="virtio"/>',
+                    '      <address type="pci" domain="0x0000" bus="0x01" slot="0x00" function="0x0"/>',
                     "    </interface>",
                 ]
             ).format(n)
@@ -331,13 +351,16 @@ class LibvirtdState(MachineState[LibvirtdDefinition]):
         def _make_os(defn):
             return [
                 "<os>",
-                '    <type arch="x86_64">hvm</type>',
-                "    <kernel>%s</kernel>" % defn.kernel,
-                "    <initrd>%s</initrd>" % defn.initrd if len(defn.kernel) > 0 else "",
-                "    <cmdline>%s</cmdline>" % defn.cmdline
-                if len(defn.kernel) > 0
-                else "",
+                "    <type arch='aarch64' machine='virt-8.0'>hvm</type>",
+                '    <loader readonly="yes" type="pflash">/run/libvirt/nix-ovmf/AAVMF_CODE.fd</loader>',
+                "    <nvram template='/run/libvirt/nix-ovmf/AAVMF_VARS.fd' type='file'>"
+                "      <source file='{0}'/>".format(self.nvram.path()),
+                "    </nvram>",
                 "</os>",
+                "<features>",
+                "  <acpi/>",
+                "  <gic version='3'/>",
+                "</features>"
             ]
 
         domain_fmt = "\n".join(
@@ -345,14 +368,26 @@ class LibvirtdState(MachineState[LibvirtdDefinition]):
                 '<domain type="{5}">',
                 "  <name>{0}</name>",
                 '  <memory unit="MiB">{1}</memory>',
-                "  <vcpu>{4}</vcpu>",
+                "  <vcpu cpuset='4-7'>{4}</vcpu>",
                 "\n".join(_make_os(defn)),
-                "  <devices>",
+                '  <cpu mode="host-passthrough" check="none"/>',
+                '  <devices>',
                 "    <emulator>{2}</emulator>",
+                "    <controller type='pci' index='0' model='pcie-root'/>",
+                '    <controller type="usb" index="0" model="qemu-xhci" ports="15">',
+                '      <address type="pci" domain="0x0000" bus="0x02" slot="0x00" function="0x0"/>',
+                '    </controller>',
+                # "\n".join([
+                # ("    <controller type='pci' index='{0}' model='pcie-root-port'>" +
+                # "      <model name='pcie-root-port'/>" +
+                # "      <target chassis='1' port='{0}'/>" +
+                # "      <address type='pci' domain='0x0000' bus='0x00' slot='{0}' function='0x0'/>" +
+                # "    </controller>").format(n) for n in range(1, 32)
+                # ]),
                 '    <disk type="file" device="disk">',
                 '      <driver name="qemu" type="qcow2"/>',
                 '      <source file="{3}"/>',
-                '      <target dev="hda"/>',
+                '      <target dev="vda" bus="virtio"/>',
                 "    </disk>",
                 "\n".join([iface(n) for n in defn.networks]),
                 '    <graphics type="vnc" port="-1" autoport="yes"/>'
@@ -360,6 +395,18 @@ class LibvirtdState(MachineState[LibvirtdDefinition]):
                 else "",
                 '    <input type="keyboard" bus="usb"/>',
                 '    <input type="mouse" bus="usb"/>',
+                '    <serial type="pty">',
+                '      <target type="system-serial" port="0">',
+                '        <model name="pl011"/>',
+                '      </target>',
+                '    </serial>',
+                '    <console type="pty">',
+                '      <target type="serial" port="0"/>',
+                '    </console>',
+                '    <channel type="unix">',
+                '      <target type="virtio" name="org.qemu.guest_agent.0"/>',
+                '      <address type="virtio-serial" controller="0" bus="0" port="1"/>',
+                '    </channel>',
                 defn.extra_devices,
                 "  </devices>",
                 defn.extra_domain,
@@ -438,11 +485,13 @@ class LibvirtdState(MachineState[LibvirtdDefinition]):
         self.state = self.STOPPED
 
     def destroy(self, wipe=False):
+        VIR_DOMAIN_UNDEFINE_NVRAM = 4
+
         self.log_start("destroying... ")
 
         if self.vm_id is not None:
             self.stop()
-            if self.dom.undefine() != 0:
+            if self.dom.undefineFlags(VIR_DOMAIN_UNDEFINE_NVRAM) != 0:
                 self.log("Failed undefining domain")
                 return False
 
@@ -453,5 +502,7 @@ class LibvirtdState(MachineState[LibvirtdDefinition]):
 
         if self.storage_volume_name is not None:
             self.vol.delete()
+        if self.nvram_volume_name is not None:
+            self.nvram.delete()
 
         return True
