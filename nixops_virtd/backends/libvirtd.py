@@ -221,11 +221,11 @@ class LibvirtdState(MachineState[LibvirtdDefinition]):
             self.storage_volume_name = self.vol.name()
         self.nvram_volume_name = 'nvram-' + self.storage_volume_name.replace('qcow2', 'raw')
 
-        print(self.storage_volume_name)
-        print(self.nvram_volume_name)
+        # print(self.storage_volume_name)
+        # print(self.nvram_volume_name)
 
         self.domain_xml = self._make_domain_xml(defn)
-        print(self.domain_xml)
+        # print(self.domain_xml)
 
         if self.vm_id is None:
             # By using "define" we ensure that the domain is
